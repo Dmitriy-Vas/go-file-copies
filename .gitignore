@@ -4,6 +4,8 @@
 *.dll
 *.so
 *.dylib
+Linux*
+Darwin*
 
 # Config file
 config.json
