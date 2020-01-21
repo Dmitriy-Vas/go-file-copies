@@ -4,8 +4,6 @@
 *.dll
 *.so
 *.dylib
-Linux*
-Darwin*
 
 # Config file
 config.json
@@ -14,8 +12,8 @@ config.json
 *.test
 
 # Output
-*.out
-duplicates.json
+build/
+output.json
 
 # IDEA configuration files
 *.iws

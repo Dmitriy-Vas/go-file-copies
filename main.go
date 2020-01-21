@@ -1,36 +1,48 @@
 package main
 
-//#region Header
 import (
 	"encoding/json"
-	"fmt"
-	"hash/crc32"
+	"flag"
+	"github.com/cespare/xxhash/v2"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
-)
-
-const (
-	OS_PERMISSIONS os.FileMode = 0644
+	"sync"
+	"syscall"
 )
 
 var (
-	config     Config
-	duplicates map[uint32][]File
+	config *Config
 )
 
-type Config struct {
-	Directories []string `json:"directories"`
-}
+const (
+	OsFilePermissions os.FileMode = 0644
+	DefaultConfigPath string      = "./config.json"
+	DefaultOutputPath string      = "./output.json"
+)
 
-type File struct {
-	Hash uint32
-	Path string
-}
+type (
+	Config struct {
+		ConfigPath string
+		OutputPath string
 
-//#endregion
+		// Paths to directories, which has duplicates
+		Directories []string `json:"dirs"`
+	}
+
+	File     string
+
+	Executor struct {
+		mutex *sync.Mutex
+		wg    *sync.WaitGroup
+
+		// Results, which will be saved in JSON
+		// map[xxHash][]Path
+		Results map[uint64][]File
+	}
+)
 
 func isErr(err error) {
 	if err != nil {
@@ -38,94 +50,101 @@ func isErr(err error) {
 	}
 }
 
-//#region Storage
-func getConfig() {
-	data, err := ioutil.ReadFile("config.json")
-	isErr(err)
-	err = json.Unmarshal(data, &config)
-	isErr(err)
-}
-
-func saveConfig() {
-	data, err := json.Marshal(&config)
-	isErr(err)
-	err = ioutil.WriteFile("config.json", data, OS_PERMISSIONS)
-	isErr(err)
-	fmt.Println("Config successfully saved!")
-}
-
-func saveResult() {
-	data, err := json.Marshal(&duplicates)
-	isErr(err)
-	err = ioutil.WriteFile("duplicates.json", data, OS_PERMISSIONS)
-	isErr(err)
-}
-
-//#endregion
-
-func getCRCHash(name string) uint32 {
-	data, err := ioutil.ReadFile(name)
-	isErr(err)
-	return crc32.ChecksumIEEE(data)
-}
-
-func getFilesToScan() {
-	duplicates = make(map[uint32][]File)
-	// По очереди берём пути из конфига и проходим по ним, собирая все найденные файлы
+// Check directories, which specified as paths with duplicates, to exists
+// Returns non-existing directory
+func (c *Config) IsDirsExists() (dir string) {
 	for _, dir := range config.Directories {
-		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			// Проверяем путь на директорию, добавляем только файлы
-			if !info.IsDir() {
-				// Получаем хэш файла
-				hash := getCRCHash(path)
-				f := File{
-					Path: path,
-					Hash: hash,
-				}
-				duplicates[hash] = append(duplicates[hash], f)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			return dir
+		}
+	}
+	return
+}
+
+// Walkthrough specified directories and save paths to all found files
+// Returns slice of found paths
+func (c *Config) GetFiles() []File {
+	output := make([]File, 0)
+	for _, dir := range config.Directories {
+		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if info.IsDir() {
+				return nil
 			}
+			output = append(output, File(path))
 			return nil
 		})
-		isErr(err)
 	}
-
-	fmt.Println("Found", len(duplicates), "hashes")
+	return output
 }
 
-func checkFiles() {
-	result := make(map[uint32][]File)
+// Get uint64 hash from a file, using xxHash algorithm
+// https://github.com/Cyan4973/xxHash#benchmarks
+func (f File) GetHash() uint64 {
+	raw, err := ioutil.ReadFile(string(f))
+	isErr(err)
+	return xxhash.Sum64(raw)
+}
 
-	for h, v := range duplicates {
-		if len(v) == 1 {
-			continue
-		}
-		result[h] = duplicates[h]
-	}
-	duplicates = result
+// Collect all files and save their hashes to the mapping
+func (e *Executor) SaveFileHash(file File) {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+	defer e.wg.Done()
 
-	fmt.Println("Found", len(duplicates), "copies")
+	hash := file.GetHash()
+	e.Results[hash] = append(e.Results[hash], file)
+}
+
+func init() {
+	config = new(Config)
+
+	flag.StringVar(&config.ConfigPath, "config", DefaultConfigPath, "Use this flag to specify the path to your config file, which has paths to directories with duplicates.")
+	flag.StringVar(&config.OutputPath, "output", DefaultOutputPath, "Use this flag to specify the path to the output file with results.")
+	flag.Parse()
+
+	raw, err := ioutil.ReadFile(config.ConfigPath)
+	isErr(err)
+	isErr(json.Unmarshal(raw, &config))
 }
 
 func main() {
-	// Загружаем конфиг с диска
-	getConfig()
-
-	// Отлавливаем Ctrl^C для сохранения конфига
 	go func() {
 		signalChan := make(chan os.Signal, 1)
-		signal.Notify(signalChan, os.Interrupt)
+		signal.Notify(signalChan, os.Interrupt, syscall.SIGKILL, syscall.SIGHUP)
+		defer close(signalChan)
 
 		<-signalChan
-
-		saveConfig()
+		log.Println("Shutting down the program...")
 		os.Exit(0)
 	}()
-	// Сохраняем конфиг при ошибке или если программа закончила выполнение
-	defer saveConfig()
 
-	getFilesToScan()
+	if dir := config.IsDirsExists(); dir != "" {
+		log.Fatalf("Directory %s can not be found.", dir)
+	}
 
-	checkFiles()
+	files := config.GetFiles()
+	log.Printf("Found %d files.", len(files))
 
-	saveResult()
+	exec := &Executor{
+		mutex:   new(sync.Mutex),
+		wg:      new(sync.WaitGroup),
+		Results: make(map[uint64][]File),
+	}
+	for _, file := range files {
+		exec.wg.Add(1)
+		go exec.SaveFileHash(file)
+	}
+	exec.wg.Wait()
+
+	for hash, files := range exec.Results {
+		if len(files) <= 1 {
+			delete(exec.Results, hash)
+		}
+	}
+	log.Printf("Found %d hashes of duplicates.", len(exec.Results))
+
+	raw, err := json.Marshal(exec.Results)
+	isErr(err)
+	isErr(ioutil.WriteFile(config.OutputPath, raw, OsFilePermissions))
+	log.Printf("All results saved to %s", config.OutputPath)
 }
